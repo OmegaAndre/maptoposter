@@ -391,7 +391,7 @@ def get_coordinates(city, country):
     raise ValueError(f"Could not find coordinates for {city}, {country}")
 
 
-def get_crop_limits(road_crs, center_lat_lon, fig, dist):
+def get_crop_limits(road_crs, center_lat_lon, fig, dist, map_offset_x=0, map_offset_y=0):
     """
     Crop inward to preserve aspect ratio while guaranteeing
     full coverage of the requested radius.
@@ -420,6 +420,10 @@ def get_crop_limits(road_crs, center_lat_lon, fig, dist):
         half_y = half_x / aspect
     else:  # portrait → reduce width
         half_x = half_y * aspect
+
+    # Shift the viewport opposite the requested movement of the city on the page.
+    center_x -= 2 * half_x * map_offset_x
+    center_y -= 2 * half_y * map_offset_y
 
     return (
         (center_x - half_x, center_x + half_x),
@@ -500,6 +504,40 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
         return None
 
 
+def read_local_places(source, place_filter, columns):
+    return pyogrio.read_dataframe(
+        source,
+        layer="points",
+        columns=columns,
+        where=f"place IN ({place_filter})",
+        TAGS_FORMAT="JSON",
+    )
+
+
+def list_local_cities(osm_file):
+    """Return named city, town and municipality points for the desktop picker."""
+    source = Path(osm_file).resolve(strict=True)
+    stat = source.stat()
+    signature = repr((str(source), stat.st_size, stat.st_mtime_ns))
+    key = f"local_city_list_{sha256(signature.encode('utf-8')).hexdigest()}"
+    cached = cache_get(key, recover=True)
+    if cached is not None:
+        return cached
+
+    places = read_local_places(source, "'city', 'town', 'municipality'", ["name"])
+    cities = sorted(
+        {(name.strip(), geometry.y, geometry.x)
+         for name, geometry in places.itertuples(index=False, name=None)
+         if isinstance(name, str) and name.strip() and geometry is not None and not geometry.is_empty},
+        key=lambda city: (city[0].casefold(), city[1], city[2]),
+    )
+    try:
+        cache_set(key, cities, atomic=True)
+    except CacheError as error:
+        print(f"Warning: {error}", file=sys.stderr)
+    return cities
+
+
 def get_local_coordinates(osm_file, city):
     """Find a named settlement in the local OSM file."""
     source = Path(osm_file).resolve(strict=True)
@@ -513,12 +551,10 @@ def get_local_coordinates(osm_file, city):
         return cached
 
     print(f"Looking up {city} in {source.name}...", flush=True)
-    places = pyogrio.read_dataframe(
+    places = read_local_places(
         source,
-        layer="points",
-        columns=["name", "place", "other_tags"],
-        where="place IN ('city', 'town', 'municipality', 'village', 'hamlet', 'suburb', 'borough')",
-        TAGS_FORMAT="JSON",
+        "'city', 'town', 'municipality', 'village', 'hamlet', 'suburb', 'borough'",
+        ["name", "place", "other_tags"],
     )
     matches = set()
     city_matches = set()
@@ -636,6 +672,13 @@ def create_poster(
     display_country=None,
     fonts=None,
     osm_file=None,
+    text_offset_y=0,
+    png_pixels=None,
+    preview=False,
+    show_attribution=True,
+    show_coordinates=True,
+    map_offset_x=0,
+    map_offset_y=0,
 ):
     """
     Generate a complete map poster with roads, water, parks, and typography.
@@ -655,6 +698,8 @@ def create_poster(
         country_label: Optional override for country text on poster
         _name_label: Optional override for city name (unused, reserved for future use)
         osm_file: Optional local .osm or .pbf file to read instead of querying Overpass
+        map_offset_x: Rightward city displacement as a fraction of the map width
+        map_offset_y: Upward city displacement as a fraction of the map height
 
     Raises:
         RuntimeError: If street network data cannot be retrieved
@@ -668,7 +713,9 @@ def create_poster(
 
     compensated_dist = dist * (max(height, width) / min(height, width)) / 4  # To compensate for viewport crop
     if osm_file is not None:
-        roads, water, parks = load_local_layers(osm_file, point, compensated_dist)
+        # Cover all allowed offsets with one cache entry when adjusting the framing.
+        data_dist = 2 * compensated_dist if map_offset_x or map_offset_y else compensated_dist
+        roads, water, parks = load_local_layers(osm_file, point, data_dist)
     else:
         # Progress bar for data fetching
         with tqdm(
@@ -741,7 +788,9 @@ def create_poster(
     edge_widths = get_edge_widths_by_type(roads)
 
     # Determine cropping limits to maintain the poster aspect ratio
-    crop_xlim, crop_ylim = get_crop_limits(road_crs, point, fig, compensated_dist)
+    crop_xlim, crop_ylim = get_crop_limits(
+        road_crs, point, fig, compensated_dist, map_offset_x, map_offset_y
+    )
     if osm_file is not None:
         roads.plot(ax=ax, color=edge_colors, linewidth=edge_widths, zorder=2)
         ax.set_axis_off()
@@ -830,7 +879,7 @@ def create_poster(
     # --- BOTTOM TEXT ---
     ax.text(
         0.5,
-        0.14,
+        0.14 + text_offset_y,
         spaced_city,
         transform=ax.transAxes,
         color=THEME["text"],
@@ -841,7 +890,7 @@ def create_poster(
 
     ax.text(
         0.5,
-        0.10,
+        0.10 + text_offset_y,
         display_country.upper(),
         transform=ax.transAxes,
         color=THEME["text"],
@@ -850,54 +899,55 @@ def create_poster(
         zorder=11,
     )
 
-    lat, lon = point
-    coords = (
-        f"{lat:.4f}° N / {lon:.4f}° E"
-        if lat >= 0
-        else f"{abs(lat):.4f}° S / {lon:.4f}° E"
-    )
-    if lon < 0:
-        coords = coords.replace("E", "W")
+    if show_coordinates:
+        lat, lon = point
+        coords = (
+            f"{lat:.4f}° N / {lon:.4f}° E"
+            if lat >= 0
+            else f"{abs(lat):.4f}° S / {lon:.4f}° E"
+        )
+        if lon < 0:
+            coords = coords.replace("E", "W")
 
-    ax.text(
-        0.5,
-        0.07,
-        coords,
-        transform=ax.transAxes,
-        color=THEME["text"],
-        alpha=0.7,
-        ha="center",
-        fontproperties=font_coords,
-        zorder=11,
-    )
+        ax.text(
+            0.5,
+            0.07 + text_offset_y,
+            coords,
+            transform=ax.transAxes,
+            color=THEME["text"],
+            alpha=0.7,
+            ha="center",
+            fontproperties=font_coords,
+            zorder=11,
+        )
 
     ax.plot(
         [0.4, 0.6],
-        [0.125, 0.125],
+        [0.125 + text_offset_y] * 2,
         transform=ax.transAxes,
         color=THEME["text"],
         linewidth=1 * scale_factor,
         zorder=11,
     )
 
-    # --- ATTRIBUTION (bottom right) ---
-    if FONTS:
-        font_attr = FontProperties(fname=FONTS["light"], size=8)
-    else:
-        font_attr = FontProperties(family="monospace", size=8)
+    if show_attribution:
+        if FONTS:
+            font_attr = FontProperties(fname=FONTS["light"], size=8)
+        else:
+            font_attr = FontProperties(family="monospace", size=8)
 
-    ax.text(
-        0.98,
-        0.02,
-        "© OpenStreetMap contributors",
-        transform=ax.transAxes,
-        color=THEME["text"],
-        alpha=0.5,
-        ha="right",
-        va="bottom",
-        fontproperties=font_attr,
-        zorder=11,
-    )
+        ax.text(
+            0.98,
+            0.02,
+            "© OpenStreetMap contributors",
+            transform=ax.transAxes,
+            color=THEME["text"],
+            alpha=0.5,
+            ha="right",
+            va="bottom",
+            fontproperties=font_attr,
+            zorder=11,
+        )
 
     # 5. Save
     print(f"Saving to {output_file}...")
@@ -912,6 +962,11 @@ def create_poster(
     # DPI matters mainly for raster formats
     if fmt == "png":
         save_kwargs["dpi"] = 300
+        if png_pixels is not None:
+            save_kwargs.pop("bbox_inches")
+            save_kwargs.pop("pad_inches")
+            if preview:
+                save_kwargs["dpi"] = min(300, 300 * 900 / max(png_pixels))
 
     plt.savefig(output_file, format=fmt, **save_kwargs)
 
@@ -1108,7 +1163,50 @@ Examples:
         help="Output format for the poster (default: png)",
     )
 
+    parser.add_argument(
+        "--text-offset-y",
+        type=float,
+        default=0,
+        help="Vertical offset of the title block as a fraction of the map height",
+    )
+    parser.add_argument("--output", type=Path, help="Output file path for one poster")
+    parser.add_argument(
+        "--map-offset-x", type=float, default=0,
+        help="Move the city right by a fraction of the map width (local OSM only)",
+    )
+    parser.add_argument(
+        "--map-offset-y", type=float, default=0,
+        help="Move the city up by a fraction of the map height (local OSM only)",
+    )
+    parser.add_argument("--pixels", nargs=2, type=int, metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--preview", action="store_true", help="Render a smaller PNG preview")
+    parser.add_argument("--hide-attribution", action="store_true", help="Hide the map attribution line")
+    parser.add_argument("--hide-coordinates", action="store_true", help="Hide coordinates printed on the poster")
+    parser.add_argument("--list-local-cities", action="store_true", help="List local city points as JSON")
     args = parser.parse_args()
+    if args.list_local_cities:
+        if args.osm_file is None:
+            parser.error("--list-local-cities requires --osm-file")
+        try:
+            print(json.dumps(list_local_cities(args.osm_file), ensure_ascii=True))
+        except Exception as error:
+            parser.exit(1, f"{error}\n")
+        sys.exit(0)
+    if args.pixels is not None:
+        if args.format != "png" or not all(300 <= size <= 12000 for size in args.pixels):
+            parser.error("--pixels requires PNG and dimensions between 300 and 12000")
+        # Round up by a tiny fraction to avoid floating-point truncation in Agg.
+        args.width, args.height = ((size + 1e-8) / 300 for size in args.pixels)
+    if args.preview and args.pixels is None:
+        parser.error("--preview requires --pixels")
+    if not -0.04 <= args.text_offset_y <= 0.70:
+        parser.error("--text-offset-y must be between -0.04 and 0.70")
+    if not all(-0.5 <= offset <= 0.5 for offset in (args.map_offset_x, args.map_offset_y)):
+        parser.error("--map-offset-x and --map-offset-y must be between -0.5 and 0.5")
+    if args.osm_file is None and (args.map_offset_x or args.map_offset_y):
+        parser.error("Map offsets require --osm-file")
+    if args.output is not None and args.all_themes:
+        parser.error("--output requires a single theme")
 
     # If no arguments provided, show examples
     if len(sys.argv) == 1:
@@ -1136,12 +1234,12 @@ Examples:
             parser.error("--distance must be greater than zero with --osm-file")
 
     # Enforce maximum dimensions
-    if args.width > 20:
+    if args.pixels is None and args.width > 20:
         print(
             f"⚠ Width {args.width} exceeds the maximum allowed limit of 20. It's enforced as max limit 20."
         )
         args.width = 20.0
-    if args.height > 20:
+    if args.pixels is None and args.height > 20:
         print(
             f"⚠ Height {args.height} exceeds the maximum allowed limit of 20. It's enforced as max limit 20."
         )
@@ -1198,7 +1296,9 @@ Examples:
 
         for theme_name in themes_to_generate:
             THEME = load_theme(theme_name)
-            output_file = generate_output_filename(args.city, theme_name, args.format)
+            output_file = args.output or generate_output_filename(
+                args.city, theme_name, args.format
+            )
             create_poster(
                 args.city,
                 args.country,
@@ -1213,6 +1313,13 @@ Examples:
                 display_country=args.display_country,
                 fonts=custom_fonts,
                 osm_file=args.osm_file,
+                text_offset_y=args.text_offset_y,
+                png_pixels=args.pixels,
+                preview=args.preview,
+                show_attribution=not args.hide_attribution,
+                show_coordinates=not args.hide_coordinates,
+                map_offset_x=args.map_offset_x,
+                map_offset_y=args.map_offset_y,
             )
 
         print("\n" + "=" * 50)

@@ -1,5 +1,7 @@
 # City Map Poster Generator
 
+[简体中文](README.zh-CN.md)
+
 Generate minimalist map posters with [MapToPoster](https://github.com/originalankur/maptoposter). This fork adds offline rendering from local OpenStreetMap data.
 
 ## Examples
@@ -32,6 +34,21 @@ pip install -r requirements.txt
 ```
 
 ## Usage
+
+### Desktop app for local OSM data
+
+```bash
+uv sync --locked
+uv run python poster_gui.py
+```
+
+Tkinter is required. Run `uv run python -m tkinter` to check that it is available in your Python installation.
+
+1. Select a local `.osm` or `.pbf` file from `osm/` or browse to another file.
+2. Type part of a city name and choose a match from the local data. You can also enter a name manually. Leave latitude and longitude blank for local lookup, or enter both to override the center.
+3. Set the theme, system font, map extent in kilometers, and poster dimensions in pixels or inches. PNG export supports 300 to 12,000 pixels per side at 300 DPI.
+4. Adjust the title position and the city’s horizontal and vertical position as percentages of the map width or height. The coordinate and OpenStreetMap labels have separate visibility controls.
+5. Select **Generate Preview**, then **Save PNG**. The preview uses at most 900 pixels on its longest edge. Saving renders the full-size image with the settings from the last preview.
 
 ### Generate Poster
 
