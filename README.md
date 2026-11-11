@@ -1,24 +1,10 @@
 # City Map Poster Generator
 
-Generate beautiful, minimalist map posters for any city in the world.
-
-<img src="posters/singapore_neon_cyberpunk_20260118_153328.png" width="250">
-<img src="posters/dubai_midnight_blue_20260118_140807.png" width="250">
+Generate minimalist map posters with [MapToPoster](https://github.com/originalankur/maptoposter). This fork adds offline rendering from local OpenStreetMap data.
 
 ## Examples
 
-| Country      | City           | Theme           | Poster |
-|:------------:|:--------------:|:---------------:|:------:|
-| USA          | San Francisco  | sunset          | <img src="posters/san_francisco_sunset_20260118_144726.png" width="250"> |
-| Spain        | Barcelona      | warm_beige      | <img src="posters/barcelona_warm_beige_20260118_140048.png" width="250"> |
-| Italy        | Venice         | blueprint       | <img src="posters/venice_blueprint_20260118_140505.png" width="250"> |
-| Japan        | Tokyo          | japanese_ink    | <img src="posters/tokyo_japanese_ink_20260118_142446.png" width="250"> |
-| India        | Mumbai         | contrast_zones  | <img src="posters/mumbai_contrast_zones_20260118_145843.png" width="250"> |
-| Morocco      | Marrakech      | terracotta      | <img src="posters/marrakech_terracotta_20260118_143253.png" width="250"> |
-| Singapore    | Singapore      | neon_cyberpunk  | <img src="posters/singapore_neon_cyberpunk_20260118_153328.png" width="250"> |
-| Australia    | Melbourne      | forest          | <img src="posters/melbourne_forest_20260118_153446.png" width="250"> |
-| UAE          | Dubai          | midnight_blue   | <img src="posters/dubai_midnight_blue_20260118_140807.png" width="250"> |
-| USA          | Seattle        | emerald         | <img src="posters/seattle_emerald_20260124_162244.png" width="250"> |
+See the [original project's poster gallery](https://github.com/originalankur/maptoposter#examples) for sample posters.
 
 ## Installation
 
@@ -34,6 +20,8 @@ uv run ./create_map_poster.py --city "Paris" --country "France"
 uv sync --locked
 uv run ./create_map_poster.py --city "Paris" --country "France"
 ```
+
+The lockfile uses PyPI. If a custom uv mirror causes a lockfile mismatch, run `uv sync --locked --default-index https://pypi.org/simple`.
 
 ### With pip + venv
 
@@ -59,12 +47,22 @@ Otherwise (pip + venv):
 python create_map_poster.py --city <city> --country <country> [options]
 ```
 
+### Use a local OSM file
+
+Download a regional `.osm.pbf` extract, such as [Zhejiang from Geofabrik](https://download.geofabrik.de/asia/china/zhejiang.html), and place it in `osm/` in the project directory. Local map data and generated caches are ignored by Git.
+
+```bash
+uv run python create_map_poster.py --osm-file osm/zhejiang-latest.osm.pbf --city Hangzhou --country China --distance 30000
+```
+
+`--osm-file` accepts `.osm` and `.pbf` files. The script looks up the city in that file and reads the map layers offline. Supply both `--latitude` and `--longitude` to pick a different center or resolve a missing or ambiguous city name. `--country` is required for the poster label in local mode. If you specify `--font-family`, use a font installed on your system.
+
 ### Required Options
 
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--city` | `-c` | City name (used for geocoding) |
-| `--country` | `-C` | Country name (used for geocoding) |
+| `--country` | `-C` | Country name for the poster label and online geocoding |
 
 ### Optional Flags
 
@@ -74,11 +72,12 @@ python create_map_poster.py --city <city> --country <country> [options]
 | **OPTIONAL:** `--longitude` | `-long` | Override longitude center point (use with --latitude) | |
 | **OPTIONAL:** `--country-label` | | Override country text displayed on poster | |
 | **OPTIONAL:** `--theme` | `-t` | Theme name | terracotta |
-| **OPTIONAL:** `--distance` | `-d` | Map radius in meters | 18000 |
+| **OPTIONAL:** `--distance` | `-d` | Map extent in meters. The short edge of the map spans half this value. | 18000 |
 | **OPTIONAL:** `--list-themes` | | List all available themes | |
 | **OPTIONAL:** `--all-themes` | | Generate posters for all available themes | |
 | **OPTIONAL:** `--width` | `-W` | Image width in inches | 12 (max: 20) |
 | **OPTIONAL:** `--height` | `-H` | Image height in inches | 16 (max: 20) |
+| **OPTIONAL:** `--format` | `-f` | Output format (`png`, `svg`, or `pdf`) | png |
 
 ### Multilingual Support - i18n
 
@@ -107,7 +106,7 @@ python create_map_poster.py -c "Dubai" -C "UAE" -dc "دبي" -dC "الإمارا
 
 ### Resolution Guide (300 DPI)
 
-Use these values for `-W` and `-H` to target specific resolutions:
+Use these values for `-W` and `-H` to target approximate PNG resolutions. Export padding adds a small margin.
 
 | Target | Resolution (px) | Inches (-W / -H) |
 |--------|-----------------|------------------|
@@ -203,7 +202,7 @@ python create_map_poster.py -c "Tokyo" -C "Japan" --all-themes
 
 ## Themes
 
-17 themes available in `themes/` directory:
+Themes are stored in the `themes/` directory. Run `python create_map_poster.py --list-themes` to see the available themes.
 
 | Theme | Style |
 |-------|-------|
@@ -227,10 +226,10 @@ python create_map_poster.py -c "Tokyo" -C "Japan" --all-themes
 
 ## Output
 
-Posters are saved to `posters/` directory with format:
+Posters are saved to the `posters/` directory. The extension follows `--format` and defaults to `png`.
 
 ```text
-{city}_{theme}_{YYYYMMDD_HHMMSS}.png
+{city}_{theme}_{YYYYMMDD_HHMMSS}.{extension}
 ```
 
 ## Adding Custom Themes
@@ -262,6 +261,7 @@ map_poster/
 ├── create_map_poster.py    # Main script
 ├── font_management.py      # Font loading and Google Fonts integration
 ├── themes/                 # Theme JSON files
+├── osm/                    # Local OSM files (create as needed, ignored by Git)
 ├── fonts/                  # Font files
 │   ├── Roboto-*.ttf        # Default Roboto fonts
 │   └── cache/              # Downloaded Google Fonts (auto-generated)

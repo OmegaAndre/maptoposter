@@ -1,8 +1,16 @@
-cache/*
+# Local map data and caches
+/cache/
+/osm/
+/fonts/cache/
+
+# Generated posters
+/posters/
 
 # Virtual environments
 env/
-.env/
+.env
+.env.*
+!.env.example
 .venv/
 venv/
 
@@ -26,7 +34,7 @@ Thumbs.db
 .cache/*
 
 # Package manager
-uv.lock
+/.uv-cache/
 
 # Test outputs
 test_venv/

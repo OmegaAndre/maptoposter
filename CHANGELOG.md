@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - Community Contributions
 
 ### Added
+- **Offline map generation** - Read local `.osm` and `.osm.pbf` files with `--osm-file`. Resolve the city from the file or use explicit coordinates. Reuse local map layers for repeated renders.
+- **System fonts in local mode** - Select an installed font with `--font-family` for multilingual poster labels.
 - **uv package manager support** ([PR #20](https://github.com/originalankur/maptoposter/pull/20))
   - Added `pyproject.toml` with project metadata and dependencies
   - Added `uv.lock` for reproducible builds

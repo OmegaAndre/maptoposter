@@ -14,20 +14,24 @@ import os
 import pickle
 import sys
 import time
+from contextlib import suppress
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import cast
 
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import osmnx as ox
+import pyogrio
 from geopandas import GeoDataFrame
 from geopy.geocoders import Nominatim
 from lat_lon_parser import parse
-from matplotlib.font_manager import FontProperties
+from matplotlib.font_manager import FontProperties, findfont
 from networkx import MultiDiGraph
-from shapely.geometry import Point
+from shapely.geometry import Point, Polygon, box
 from tqdm import tqdm
 
 from font_management import load_fonts
@@ -64,18 +68,19 @@ def _cache_path(key: str) -> str:
     return os.path.join(CACHE_DIR, f"{safe}.pkl")
 
 
-def cache_get(key: str):
+def cache_get(key: str, *, recover=False):
     """
     Retrieve a cached object by key.
 
     Args:
         key: Cache key identifier
+        recover: Treat unreadable local layer caches as misses
 
     Returns:
         Cached object if found, None otherwise
 
     Raises:
-        CacheError: If cache read operation fails
+        CacheError: If the read fails and recover is False
     """
     try:
         path = _cache_path(key)
@@ -84,28 +89,42 @@ def cache_get(key: str):
         with open(path, "rb") as f:
             return pickle.load(f)
     except Exception as e:
-        raise CacheError(f"Cache read failed: {e}") from e
+        if not recover:
+            raise CacheError(f"Cache read failed: {e}") from e
+        print(f"Warning: Could not read cache {key}: {e}", file=sys.stderr, flush=True)
+        return None
 
 
-def cache_set(key: str, value):
+def cache_set(key: str, value, *, atomic=False):
     """
     Store an object in the cache.
 
     Args:
         key: Cache key identifier
         value: Object to cache (must be picklable)
+        atomic: Publish local layer cache files only after writing them completely
 
     Raises:
         CacheError: If cache write operation fails
     """
+    temporary_path = None
     try:
-        if not os.path.exists(CACHE_DIR):
-            os.makedirs(CACHE_DIR)
+        CACHE_DIR.mkdir(exist_ok=True)
         path = _cache_path(key)
-        with open(path, "wb") as f:
+        if not atomic:
+            with open(path, "wb") as f:
+                pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+            return
+        with NamedTemporaryFile(dir=CACHE_DIR, suffix=".tmp", delete=False) as f:
+            temporary_path = Path(f.name)
             pickle.dump(value, f, protocol=pickle.HIGHEST_PROTOCOL)
+        temporary_path.replace(path)
     except Exception as e:
         raise CacheError(f"Cache write failed: {e}") from e
+    finally:
+        if temporary_path is not None:
+            with suppress(OSError):
+                temporary_path.unlink(missing_ok=True)
 
 
 # Font loading now handled by font_management.py module
@@ -252,6 +271,12 @@ def create_gradient_fade(ax, color, location="bottom", zorder=10):
     )
 
 
+def road_highway_types(roads):
+    if isinstance(roads, GeoDataFrame):
+        return roads["highway"]
+    return (data.get("highway", "unclassified") for _, _, data in roads.edges(data=True))
+
+
 def get_edge_colors_by_type(g):
     """
     Assigns colors to edges based on road type hierarchy.
@@ -259,10 +284,7 @@ def get_edge_colors_by_type(g):
     """
     edge_colors = []
 
-    for _u, _v, data in g.edges(data=True):
-        # Get the highway type (can be a list or string)
-        highway = data.get('highway', 'unclassified')
-
+    for highway in road_highway_types(g):
         # Handle list of highway types (take the first one)
         if isinstance(highway, list):
             highway = highway[0] if highway else 'unclassified'
@@ -293,8 +315,7 @@ def get_edge_widths_by_type(g):
     """
     edge_widths = []
 
-    for _u, _v, data in g.edges(data=True):
-        highway = data.get('highway', 'unclassified')
+    for highway in road_highway_types(g):
 
         if isinstance(highway, list):
             highway = highway[0] if highway else 'unclassified'
@@ -370,7 +391,7 @@ def get_coordinates(city, country):
     raise ValueError(f"Could not find coordinates for {city}, {country}")
 
 
-def get_crop_limits(g_proj, center_lat_lon, fig, dist):
+def get_crop_limits(road_crs, center_lat_lon, fig, dist):
     """
     Crop inward to preserve aspect ratio while guaranteeing
     full coverage of the requested radius.
@@ -382,7 +403,7 @@ def get_crop_limits(g_proj, center_lat_lon, fig, dist):
         ox.projection.project_geometry(
             Point(lon, lat),
             crs="EPSG:4326",
-            to_crs=g_proj.graph["crs"]
+            to_crs=road_crs
         )[0]
     )
     center_x, center_y = center.x, center.y
@@ -479,6 +500,127 @@ def fetch_features(point, dist, tags, name) -> GeoDataFrame | None:
         return None
 
 
+def get_local_coordinates(osm_file, city):
+    """Find a named settlement in the local OSM file."""
+    source = Path(osm_file).resolve(strict=True)
+    stat = source.stat()
+    city_name = city.strip().casefold().removesuffix("市")
+    signature = repr((str(source), stat.st_size, stat.st_mtime_ns, city_name))
+    key = f"local_coords_{sha256(signature.encode('utf-8')).hexdigest()}"
+    cached = cache_get(key, recover=True)
+    if cached is not None:
+        print(f"✓ Using cached local coordinates for {city}", flush=True)
+        return cached
+
+    print(f"Looking up {city} in {source.name}...", flush=True)
+    places = pyogrio.read_dataframe(
+        source,
+        layer="points",
+        columns=["name", "place", "other_tags"],
+        where="place IN ('city', 'town', 'municipality', 'village', 'hamlet', 'suburb', 'borough')",
+        TAGS_FORMAT="JSON",
+    )
+    matches = set()
+    city_matches = set()
+    for place in places.itertuples():
+        tags = place.other_tags
+        if isinstance(tags, str):
+            tags = json.loads(tags)
+        names = [place.name or ""]
+        names.extend(
+            value for tag, value in (tags or {}).items()
+            if tag.startswith("name:") or tag in {"alt_name", "official_name", "short_name", "int_name"}
+        )
+        if any(alias.strip().casefold().removesuffix("市") == city_name
+               for name in names for alias in name.split(";") if alias.strip()):
+            point = (place.geometry.y, place.geometry.x)
+            matches.add(point)
+            if place.place == "city":
+                city_matches.add(point)
+
+    matches = city_matches or matches
+    if not matches:
+        raise ValueError(f"Could not find {city!r} in {source.name}. Pass --latitude and --longitude.")
+    if len(matches) > 1:
+        raise ValueError(f"Multiple places named {city!r} in {source.name}. Pass --latitude and --longitude.")
+
+    point = matches.pop()
+    try:
+        cache_set(key, point, atomic=True)
+    except CacheError as e:
+        print(f"Warning: {e}", file=sys.stderr)
+    print(f"✓ Local coordinates: {point[0]}, {point[1]}", flush=True)
+    return point
+
+
+def load_local_layers(osm_file, point, dist):
+    """Read and cache the road lines and filled areas for one local viewport."""
+    source = Path(osm_file).resolve(strict=True)
+    stat = source.stat()
+    version = (stat.st_size, stat.st_mtime_ns)
+    signature = repr((str(source), version, tuple(point), dist))
+    key = f"local_osm_{sha256(signature.encode('utf-8')).hexdigest()}"
+    cached = cache_get(key, recover=True)
+    if cached is not None:
+        print(f"[1–3/4] Using cached local layers from {source.name}", flush=True)
+        return cached
+
+    bbox = ox.utils_geo.bbox_from_point(point, dist)
+    source_bounds = pyogrio.read_info(source, layer="lines")["total_bounds"]
+    if source_bounds is not None and not box(*source_bounds).covers(box(*bbox)):
+        print("Warning: The requested viewport extends outside the source file bounds.", file=sys.stderr)
+
+    print(f"[1/4] Reading roads from {source.name}...", flush=True)
+    lines = pyogrio.read_dataframe(
+        source,
+        layer="lines",
+        bbox=bbox,
+        columns=["highway", "waterway"],
+        where="highway IS NOT NULL OR waterway = 'riverbank'",
+    )
+    excluded = {
+        "abandoned", "construction", "no", "planned", "platform", "proposed",
+        "raceway", "razed", "rest_area", "services",
+    }
+    roads = lines.loc[lines.highway.notna() & ~lines.highway.isin(excluded), ["highway", "geometry"]]
+    if roads.empty:
+        raise ValueError(f"No roads found in the requested viewport in {source.name}.")
+
+    print("[2/4] Reading water and parks...", flush=True)
+    riverbank_tag = '"waterway"=>"riverbank"'
+    areas = pyogrio.read_dataframe(
+        source,
+        layer="multipolygons",
+        bbox=bbox,
+        columns=["natural", "landuse", "leisure", "other_tags"],
+        where=(
+            "natural IN ('water', 'bay', 'strait') OR landuse = 'grass' OR leisure = 'park' "
+            f"OR other_tags LIKE '%{riverbank_tag}%'"
+        ),
+        TAGS_FORMAT="HSTORE",
+    )
+    is_water = areas.natural.isin(("water", "bay", "strait")) | areas.other_tags.str.contains(
+        riverbank_tag, regex=False, na=False
+    )
+    water_shapes = areas.loc[is_water].geometry.tolist()
+    # The OSM driver can return a closed waterway=riverbank way in its line layer.
+    riverbanks = lines.loc[lines.waterway.eq("riverbank")].geometry
+    water_shapes.extend(Polygon(ring.coords) for ring in riverbanks[riverbanks.is_ring])
+    water = GeoDataFrame(geometry=water_shapes, crs=areas.crs)
+    parks = areas.loc[areas.leisure.eq("park") | areas.landuse.eq("grass"), ["geometry"]]
+
+    stat = source.stat()
+    if version != (stat.st_size, stat.st_mtime_ns):
+        raise RuntimeError("The local OSM file changed while it was being read. Run the command again.")
+    layers = (roads, water, parks)
+    try:
+        cache_set(key, layers, atomic=True)
+    except CacheError as e:
+        print(f"Warning: {e}", file=sys.stderr)
+    print(f"[3/4] Loaded {len(roads):,} roads, {len(water):,} water areas and {len(parks):,} parks/green areas.", flush=True)
+    return layers
+
+
 def create_poster(
     city,
     country,
@@ -493,6 +635,7 @@ def create_poster(
     display_city=None,
     display_country=None,
     fonts=None,
+    osm_file=None,
 ):
     """
     Generate a complete map poster with roads, water, parks, and typography.
@@ -511,6 +654,7 @@ def create_poster(
         height: Poster height in inches (default: 16)
         country_label: Optional override for country text on poster
         _name_label: Optional override for city name (unused, reserved for future use)
+        osm_file: Optional local .osm or .pbf file to read instead of querying Overpass
 
     Raises:
         RuntimeError: If street network data cannot be retrieved
@@ -522,51 +666,59 @@ def create_poster(
 
     print(f"\nGenerating map for {city}, {country}...")
 
-    # Progress bar for data fetching
-    with tqdm(
-        total=3,
-        desc="Fetching map data",
-        unit="step",
-        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
-    ) as pbar:
-        # 1. Fetch Street Network
-        pbar.set_description("Downloading street network")
-        compensated_dist = dist * (max(height, width) / min(height, width)) / 4  # To compensate for viewport crop
-        g = fetch_graph(point, compensated_dist)
-        if g is None:
-            raise RuntimeError("Failed to retrieve street network data.")
-        pbar.update(1)
+    compensated_dist = dist * (max(height, width) / min(height, width)) / 4  # To compensate for viewport crop
+    if osm_file is not None:
+        roads, water, parks = load_local_layers(osm_file, point, compensated_dist)
+    else:
+        # Progress bar for data fetching
+        with tqdm(
+            total=3,
+            desc="Fetching map data",
+            unit="step",
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}",
+        ) as pbar:
+            # 1. Fetch Street Network
+            pbar.set_description("Downloading street network")
+            roads = fetch_graph(point, compensated_dist)
+            if roads is None:
+                raise RuntimeError("Failed to retrieve street network data.")
+            pbar.update(1)
 
-        # 2. Fetch Water Features
-        pbar.set_description("Downloading water features")
-        water = fetch_features(
-            point,
-            compensated_dist,
-            tags={"natural": ["water", "bay", "strait"], "waterway": "riverbank"},
-            name="water",
-        )
-        pbar.update(1)
+            # 2. Fetch Water Features
+            pbar.set_description("Downloading water features")
+            water = fetch_features(
+                point,
+                compensated_dist,
+                tags={"natural": ["water", "bay", "strait"], "waterway": "riverbank"},
+                name="water",
+            )
+            pbar.update(1)
 
-        # 3. Fetch Parks
-        pbar.set_description("Downloading parks/green spaces")
-        parks = fetch_features(
-            point,
-            compensated_dist,
-            tags={"leisure": "park", "landuse": "grass"},
-            name="parks",
-        )
-        pbar.update(1)
+            # 3. Fetch Parks
+            pbar.set_description("Downloading parks/green spaces")
+            parks = fetch_features(
+                point,
+                compensated_dist,
+                tags={"leisure": "park", "landuse": "grass"},
+                name="parks",
+            )
+            pbar.update(1)
 
-    print("✓ All data retrieved successfully!")
+        print("✓ All data retrieved successfully!")
 
     # 2. Setup Plot
-    print("Rendering map...")
+    print("[4/4] Rendering map..." if osm_file is not None else "Rendering map...", flush=True)
     fig, ax = plt.subplots(figsize=(width, height), facecolor=THEME["bg"])
     ax.set_facecolor(THEME["bg"])
     ax.set_position((0.0, 0.0, 1.0, 1.0))
 
-    # Project graph to a metric CRS so distances and aspect are linear (meters)
-    g_proj = ox.project_graph(g)
+    # Use the same projected CRS for all layers and the viewport.
+    if osm_file is not None:
+        roads = ox.projection.project_gdf(roads)
+        road_crs = roads.crs
+    else:
+        roads = ox.project_graph(roads)
+        road_crs = roads.graph["crs"]
 
     # 3. Plot Layers
     # Layer 1: Polygons (filter to only plot polygon/multipolygon geometries, not points)
@@ -574,39 +726,34 @@ def create_poster(
         # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
         water_polys = water[water.geometry.type.isin(["Polygon", "MultiPolygon"])]
         if not water_polys.empty:
-            # Project water features in the same CRS as the graph
-            try:
-                water_polys = ox.projection.project_gdf(water_polys)
-            except Exception:
-                water_polys = water_polys.to_crs(g_proj.graph['crs'])
+            water_polys = water_polys.to_crs(road_crs)
             water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=0.5)
 
     if parks is not None and not parks.empty:
         # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
         parks_polys = parks[parks.geometry.type.isin(["Polygon", "MultiPolygon"])]
         if not parks_polys.empty:
-            # Project park features in the same CRS as the graph
-            try:
-                parks_polys = ox.projection.project_gdf(parks_polys)
-            except Exception:
-                parks_polys = parks_polys.to_crs(g_proj.graph['crs'])
+            parks_polys = parks_polys.to_crs(road_crs)
             parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=0.8)
     # Layer 2: Roads with hierarchy coloring
     print("Applying road hierarchy colors...")
-    edge_colors = get_edge_colors_by_type(g_proj)
-    edge_widths = get_edge_widths_by_type(g_proj)
+    edge_colors = get_edge_colors_by_type(roads)
+    edge_widths = get_edge_widths_by_type(roads)
 
     # Determine cropping limits to maintain the poster aspect ratio
-    crop_xlim, crop_ylim = get_crop_limits(g_proj, point, fig, compensated_dist)
-    # Plot the projected graph and then apply the cropped limits
-    ox.plot_graph(
-        g_proj, ax=ax, bgcolor=THEME['bg'],
-        node_size=0,
-        edge_color=edge_colors,
-        edge_linewidth=edge_widths,
-        show=False,
-        close=False,
-    )
+    crop_xlim, crop_ylim = get_crop_limits(road_crs, point, fig, compensated_dist)
+    if osm_file is not None:
+        roads.plot(ax=ax, color=edge_colors, linewidth=edge_widths, zorder=2)
+        ax.set_axis_off()
+    else:
+        ox.plot_graph(
+            roads, ax=ax, bgcolor=THEME['bg'],
+            node_size=0,
+            edge_color=edge_colors,
+            edge_linewidth=edge_widths,
+            show=False,
+            close=False,
+        )
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlim(crop_xlim)
     ax.set_ylim(crop_ylim)
@@ -888,6 +1035,11 @@ Examples:
         help="Override longitude center point",
     )
     parser.add_argument(
+        "--osm-file",
+        type=Path,
+        help="Read a local .osm or .pbf file and look up the city offline when coordinates are omitted",
+    )
+    parser.add_argument(
         "--country-label",
         dest="country_label",
         type=str,
@@ -946,7 +1098,7 @@ Examples:
     parser.add_argument(
         "--font-family",
         type=str,
-        help='Google Fonts family name (e.g., "Noto Sans JP", "Open Sans"). If not specified, uses local Roboto fonts.',
+        help="Font family name. With --osm-file, the family must be installed locally.",
     )
     parser.add_argument(
         "--format",
@@ -973,6 +1125,15 @@ Examples:
         print("Error: --city and --country are required.\n")
         print_examples()
         sys.exit(1)
+
+    if args.osm_file is not None:
+        args.osm_file = args.osm_file.expanduser()
+        if args.osm_file.suffix.lower() not in {".osm", ".pbf"} or not args.osm_file.is_file():
+            parser.error("--osm-file must point to an existing .osm or .pbf file")
+        if bool(args.latitude) != bool(args.longitude):
+            parser.error("Pass both --latitude and --longitude, or omit both for local city lookup")
+        if args.distance <= 0:
+            parser.error("--distance must be greater than zero with --osm-file")
 
     # Enforce maximum dimensions
     if args.width > 20:
@@ -1007,9 +1168,21 @@ Examples:
     # Load custom fonts if specified
     custom_fonts = None
     if args.font_family:
-        custom_fonts = load_fonts(args.font_family)
-        if not custom_fonts:
-            print(f"⚠ Failed to load '{args.font_family}', falling back to Roboto")
+        if args.osm_file is not None:
+            try:
+                custom_fonts = {
+                    weight: findfont(
+                        FontProperties(family=[args.font_family], weight=weight),
+                        fallback_to_default=False,
+                    )
+                    for weight in ("light", "regular", "bold")
+                }
+            except ValueError:
+                parser.error(f"Install the font family '{args.font_family}' for use with --osm-file")
+        else:
+            custom_fonts = load_fonts(args.font_family)
+            if not custom_fonts:
+                print(f"⚠ Failed to load '{args.font_family}', falling back to Roboto")
 
     # Get coordinates and generate poster
     try:
@@ -1018,6 +1191,8 @@ Examples:
             lon = parse(args.longitude)
             coords = [lat, lon]
             print(f"✓ Coordinates: {', '.join([str(i) for i in coords])}")
+        elif args.osm_file is not None:
+            coords = get_local_coordinates(args.osm_file, args.city)
         else:
             coords = get_coordinates(args.city, args.country)
 
@@ -1037,6 +1212,7 @@ Examples:
                 display_city=args.display_city,
                 display_country=args.display_country,
                 fonts=custom_fonts,
+                osm_file=args.osm_file,
             )
 
         print("\n" + "=" * 50)
